@@ -12,7 +12,9 @@
 // Linux specifics:
 //   - HID: hidapi (hidraw backend), read on a QThread, events go to the GUI
 //     thread via queued signals.
-//   - Volume conflict: XGrabKey on Ctrl+VolUp/VolDown/Mute (and Ctrl+Shift,
+//   - Volume conflict (Wayland): EVIOCGRAB + uinput clone drops volume keys
+//     while Ctrl is held (see EvdevVolumeFilter).
+//   - Volume conflict (Xorg): XGrabKey on Ctrl+VolUp/VolDown/Mute (and Ctrl+Shift,
 //     plus NumLock/CapsLock variants) so the desktop never sees them.
 //     Plain volume keys are untouched.
 //   - Modifier state: evdev EVIOCGKEY (works on Wayland and Xorg).
@@ -54,6 +56,9 @@
 
 #include <fcntl.h>
 #include <linux/input.h>
+#include <linux/uinput.h>
+#include <poll.h>
+#include <cerrno>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
@@ -196,6 +201,183 @@ private:
     QSocketNotifier* notifier = nullptr;
 };
 
+// Wayland-safe replacement for the Windows keyboard hook.
+// Grabs (EVIOCGRAB) the AK820 input device(s) that can emit volume keys,
+// re-injects everything through a uinput clone, and drops volume keys that
+// start while Ctrl is held. If the app exits/crashes the kernel releases the
+// grab and destroys the clone, so the keyboard is never left dead.
+// Devices with LEDs (the plain boot keyboard) are skipped so Caps Lock LED sync
+// keeps working; the knob's consumer-control lives on the other interface.
+static inline bool testBit(const unsigned char* b, int n) { return b[n / 8] & (1 << (n % 8)); }
+
+class EvdevVolumeFilter : public QThread {
+    Q_OBJECT
+signals:
+    void failed(const QString& why);
+
+protected:
+    void run() override {
+        KeyState ks;
+        QElapsedTimer scanTimer;
+        bool first = true, warned = false;
+
+        while (!isInterruptionRequested()) {
+            if (first || scanTimer.elapsed() > 2000) {
+                first = false;
+                scanTimer.restart();
+                scan(warned);
+            }
+            if (devs.empty()) { msleep(500); continue; }
+
+            std::vector<pollfd> pfds;
+            for (const Dev& d : devs) pfds.push_back({ d.in, POLLIN, 0 });
+            if (poll(pfds.data(), pfds.size(), 200) <= 0) continue;
+
+            for (size_t i = pfds.size(); i-- > 0;) {
+                if (!(pfds[i].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL))) continue;
+                if (!pump(devs[i], ks)) {
+                    destroy(devs[i]);
+                    devs.erase(devs.begin() + i);
+                }
+            }
+        }
+        for (Dev& d : devs) destroy(d);
+        devs.clear();
+    }
+
+private:
+    struct Dev {
+        int in = -1, out = -1;
+        bool sup[3] = { false, false, false }; // mute, vol-down, vol-up
+        QByteArray path;
+    };
+    std::vector<Dev> devs;
+
+    static int volIdx(int code) {
+        if (code == KEY_MUTE) return 0;
+        if (code == KEY_VOLUMEDOWN) return 1;
+        if (code == KEY_VOLUMEUP) return 2;
+        return -1;
+    }
+
+    void scan(bool& warned) {
+        const auto entries = QDir("/dev/input").entryList({ "event*" }, QDir::System);
+        for (const QString& e : entries) {
+            QByteArray path = ("/dev/input/" + e).toLocal8Bit();
+            bool known = false;
+            for (const Dev& d : devs) if (d.path == path) { known = true; break; }
+            if (known) continue;
+            QString err;
+            if (!tryAdd(path, err) && !err.isEmpty() && !warned) {
+                warned = true;
+                qWarning("Volume suppression unavailable: %s", qPrintable(err));
+                emit failed(err);
+            }
+        }
+    }
+
+    // returns true if added; err stays empty when the device is simply not ours
+    bool tryAdd(const QByteArray& path, QString& err) {
+        int in = ::open(path.constData(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (in < 0) return false;
+
+        input_id id{};
+        unsigned char evb[(EV_MAX + 8) / 8] = {};
+        unsigned char key[(KEY_MAX + 8) / 8] = {};
+        char name[128] = {};
+        if (ioctl(in, EVIOCGID, &id) < 0 || id.vendor != VID || id.product != PID ||
+            ioctl(in, EVIOCGBIT(0, sizeof(evb)), evb) < 0 || !testBit(evb, EV_KEY) ||
+            ioctl(in, EVIOCGBIT(EV_KEY, sizeof(key)), key) < 0 || !testBit(key, KEY_VOLUMEUP) ||
+            testBit(evb, EV_LED)) {
+            ::close(in);
+            return false;
+        }
+        ioctl(in, EVIOCGNAME(sizeof(name)), name);
+
+        int out = ::open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+        if (out < 0) {
+            ::close(in);
+            err = QStringLiteral("cannot open /dev/uinput (%1). Load the module and install the udev rule.")
+                      .arg(strerror(errno));
+            return false;
+        }
+
+        ioctl(out, UI_SET_EVBIT, EV_SYN);
+        const int types[] = { EV_KEY, EV_REL, EV_ABS, EV_MSC, EV_SW }; // no EV_REP: source already repeats
+        const int maxes[] = { KEY_MAX, REL_MAX, ABS_MAX, MSC_MAX, SW_MAX };
+        const unsigned long setReq[] = { UI_SET_KEYBIT, UI_SET_RELBIT, UI_SET_ABSBIT, UI_SET_MSCBIT, UI_SET_SWBIT };
+        for (int t = 0; t < 5; ++t) {
+            if (!testBit(evb, types[t])) continue;
+            unsigned char b[(KEY_MAX + 8) / 8] = {};
+            if (ioctl(in, EVIOCGBIT(types[t], sizeof(b)), b) < 0) continue;
+            ioctl(out, UI_SET_EVBIT, types[t]);
+            for (int c = 0; c <= maxes[t]; ++c) {
+                if (!testBit(b, c)) continue;
+                ioctl(out, setReq[t], c);
+                if (types[t] == EV_ABS) {
+                    uinput_abs_setup as{};
+                    as.code = c;
+                    if (ioctl(in, EVIOCGABS(c), &as.absinfo) == 0) ioctl(out, UI_ABS_SETUP, &as);
+                }
+            }
+        }
+
+        uinput_setup us{};
+        us.id.bustype = BUS_USB;
+        us.id.vendor = VID;
+        us.id.product = 0x0820; // != PID so we never grab our own clone
+        snprintf(us.name, sizeof(us.name), "%s (filtered)", name);
+        if (ioctl(out, UI_DEV_SETUP, &us) < 0 || ioctl(out, UI_DEV_CREATE) < 0) {
+            err = QStringLiteral("uinput device creation failed (%1)").arg(strerror(errno));
+            ::close(out); ::close(in);
+            return false;
+        }
+        if (ioctl(in, EVIOCGRAB, 1) < 0) {
+            err = QStringLiteral("EVIOCGRAB failed (%1)").arg(strerror(errno));
+            ioctl(out, UI_DEV_DESTROY);
+            ::close(out); ::close(in);
+            return false;
+        }
+
+        Dev d;
+        d.in = in; d.out = out; d.path = path;
+        devs.push_back(d);
+        return true;
+    }
+
+    // false => device gone, drop it
+    bool pump(Dev& d, KeyState& ks) {
+        input_event buf[64], outb[64];
+        for (;;) {
+            ssize_t n = ::read(d.in, buf, sizeof(buf));
+            if (n < 0) return errno == EAGAIN;
+            if (n == 0) return false;
+            int cnt = int(n / sizeof(input_event)), m = 0;
+            for (int i = 0; i < cnt; ++i) {
+                const input_event& ev = buf[i];
+                if (ev.type == EV_KEY) {
+                    int vi = volIdx(ev.code);
+                    if (vi >= 0) {
+                        if (ev.value == 1) d.sup[vi] = ks.ctrl();
+                        bool drop = d.sup[vi];
+                        if (ev.value == 0) d.sup[vi] = false;
+                        if (drop) continue; // swallow press/repeat/release
+                    }
+                }
+                outb[m++] = ev;
+            }
+            if (m) { ssize_t w = ::write(d.out, outb, m * sizeof(input_event)); (void)w; }
+        }
+    }
+
+    static void destroy(Dev& d) {
+        ioctl(d.in, EVIOCGRAB, 0);
+        ioctl(d.out, UI_DEV_DESTROY);
+        ::close(d.out);
+        ::close(d.in);
+    }
+};
+
 // ------------------------- HID thread -------------------------
 
 static hid_device* openConsumerInterface() {
@@ -319,6 +501,8 @@ public:
     }
 
 public slots:
+    void notify(const QString& title, const QString& text) { balloon(title, text); }
+
     void onRotate(int dir, bool shift) {
         bool stateChanged = false;
 
@@ -615,6 +799,16 @@ int main(int argc, char* argv[]) {
     if (qEnvironmentVariable("XDG_SESSION_TYPE") == "x11")
         grabber = std::make_unique<VolumeKeyGrabber>();
 
+    // Wayland: evdev grab + uinput filter does the volume suppression
+    EvdevVolumeFilter filter;
+    if (!grabber) {
+        QObject::connect(&filter, &EvdevVolumeFilter::failed, &controller,
+                         [&controller](const QString& why) {
+                             controller.notify(QStringLiteral("Volume suppression off"), why);
+                         });
+        filter.start();
+    }
+
     HidWorker worker;
     QObject::connect(&worker, &HidWorker::rotated,    &controller, &Controller::onRotate);
     QObject::connect(&worker, &HidWorker::buttonDown, &controller, &Controller::onButtonDown);
@@ -624,7 +818,9 @@ int main(int argc, char* argv[]) {
     int rc = app.exec();
 
     worker.requestInterruption();
+    filter.requestInterruption();
     worker.wait();
+    filter.wait();
     hid_exit();
     return rc;
 }
