@@ -1,3 +1,0 @@
-# Hashes of file build rules.
-70401739613bb2f0846bb5cbad31b310 CMakeFiles/ak820-controller_autogen
-bbf85a012a74b7d23fd48d65671d0903 ak820-controller_autogen/timestamp
