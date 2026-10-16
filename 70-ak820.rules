@@ -1,0 +1,5 @@
+# Must sort before 73-seat-late.rules for uaccess to apply -> keep the 70- prefix.
+# hidraw: knob/button reports
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="320f", ATTRS{idProduct}=="505b", MODE="0660", TAG+="uaccess"
+# evdev: lets the app read Ctrl/Shift state from the keyboard (Wayland-safe)
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{id/vendor}=="320f", ATTRS{id/product}=="505b", MODE="0660", TAG+="uaccess"

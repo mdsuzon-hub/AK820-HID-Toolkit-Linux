@@ -1,0 +1,5 @@
+/home/mdsuzon/Documents/Lamp/build/CMakeFiles/ak820-controller.dir
+/home/mdsuzon/Documents/Lamp/build/CMakeFiles/edit_cache.dir
+/home/mdsuzon/Documents/Lamp/build/CMakeFiles/rebuild_cache.dir
+/home/mdsuzon/Documents/Lamp/build/CMakeFiles/ak820-controller_autogen_timestamp_deps.dir
+/home/mdsuzon/Documents/Lamp/build/CMakeFiles/ak820-controller_autogen.dir
